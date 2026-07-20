@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+main_worktree="$(dirname "$git_dir")"
+repo_name="$(basename "$main_worktree")"
+worktrees_root="${main_worktree}--worktrees"
+setup_hook="${main_worktree}--setup.sh"
+
+# Resolve the ref a brand-new branch should be created from: the repo's default
+# branch (origin/HEAD if published), falling back to a local main/master, and
+# finally to whatever HEAD currently points at.
+function default_base_ref {
+  local ref
+  ref="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
+  if [ -n "$ref" ]; then
+    echo "$ref"
+    return 0
+  fi
+  local candidate
+  for candidate in main master; do
+    if git show-ref --verify --quiet "refs/heads/${candidate}"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  git rev-parse --abbrev-ref HEAD
+}
+
+# Print the path of the worktree that currently has <branch> checked out, if any.
+function worktree_for_branch {
+  local branch="$1"
+  git worktree list --porcelain | awk -v want="refs/heads/${branch}" '
+    /^worktree /  { wt = substr($0, 10) }
+    /^branch /    { if ($2 == want) { print wt; exit } }
+  '
+}
+
+# Return success if any running process has its working directory at or below
+# <worktree>. Scans /proc, which is the reliable source on Linux.
+function worktree_in_use {
+  local worktree="$1" cwd
+  local link
+  for link in /proc/[0-9]*/cwd; do
+    cwd="$(readlink "$link" 2>/dev/null)" || continue
+    case "$cwd" in
+      "$worktree" | "$worktree"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Attempt to update <worktree>'s branch from its upstream, without ever
+# overwriting local work. Returns:
+#   0  - pulled, already up to date, or no upstream to pull from (nothing wrong)
+#   1  - an update was attempted but failed (diverged / non-fast-forward / remote
+#        unreachable); the working tree is left untouched
+function pull_branch {
+  local worktree="$1"
+
+  if ! git -C "$worktree" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+    echo "No upstream configured for this branch; skipping pull."
+    return 0
+  fi
+
+  echo "Updating branch from upstream..."
+  if git -C "$worktree" pull --ff-only; then
+    return 0
+  fi
+  return 1
+}
+
+# Path to the per-worktree setup-state file, kept beside the worktree directory
+# (i.e. under <worktrees_root>/<branch>/). Pure string manipulation, so it stays
+# valid even after the worktree itself has been removed.
+function setup_state_file {
+  local worktree="$1"
+  echo "$(dirname "$worktree")/setup-state.txt"
+}
+
+# Fingerprint identifying the state the setup hook was last run against: the
+# hook's content hash plus the worktree's checked-out commit. If either changes,
+# so does the fingerprint, and the hook is due to run again.
+function setup_fingerprint {
+  local worktree="$1"
+  local script_hash head
+  script_hash="$(git hash-object "$setup_hook")"
+  head="$(git -C "$worktree" rev-parse HEAD)"
+  printf '%s %s\n' "$script_hash" "$head"
+}
+
+# Run the setup hook with <worktree> as its working directory, honouring its
+# executable bit / shebang and falling back to bash. Propagates its exit status.
+function run_setup_hook {
+  local worktree="$1"
+  if [ -x "$setup_hook" ]; then
+    ( cd "$worktree" && "$setup_hook" )
+  else
+    ( cd "$worktree" && bash "$setup_hook" )
+  fi
+}
+
+# True if the worktree declares any submodules.
+function worktree_has_submodules {
+  [ -f "$1/.gitmodules" ]
+}
+
+function launch {
+  local worktree="$1"               # Path to an existing worktree
+  local pull="${2:-false}"          # Whether to update from the remote before launching
+  local setup_mode="${3:-auto}"     # auto | force | skip
+  local submodule_mode="${4:-on}"   # on | skip
+
+  # Optionally update the branch from its upstream first, so the setup hook sees
+  # the freshest tree. --ff-only guarantees a divergence can't overwrite local
+  # work; we record any failure and surface it prominently after the hook.
+  local pull_failed=false
+  if [ "$pull" = true ]; then
+    if ! pull_branch "$worktree"; then
+      pull_failed=true
+    fi
+  fi
+
+  # Populate submodules on every launch so the setup hook and shell see them.
+  # Cheap when already current. A failure (e.g. network for a never-fetched
+  # submodule) warns but does not abort, matching the setup-hook behaviour.
+  if [ "$submodule_mode" != skip ] && worktree_has_submodules "$worktree"; then
+    echo "Updating submodules..."
+    git -C "$worktree" submodule update --init --recursive \
+      || echo "Submodule update failed; continuing." >&2
+  fi
+
+  # Run the setup hook (if present), unless a matching fingerprint tells us the
+  # hook has already run against this exact script + commit, or the caller has
+  # forced the decision with --setup / --no-setup.
+  if [ -f "$setup_hook" ]; then
+    local state_file current_fp stored_fp="" run_setup reason
+    state_file="$(setup_state_file "$worktree")"
+    current_fp="$(setup_fingerprint "$worktree")"
+    if [ -f "$state_file" ]; then
+      stored_fp="$(cat "$state_file")"
+    fi
+
+    case "$setup_mode" in
+      force)
+        run_setup=true
+        reason="forced with --setup"
+        ;;
+      skip)
+        run_setup=false
+        reason="disabled with --no-setup"
+        ;;
+      *)
+        if [ "$current_fp" = "$stored_fp" ]; then
+          run_setup=false
+          reason="setup script and commit unchanged since last run"
+        else
+          run_setup=true
+          reason="setup script or checked-out commit changed"
+        fi
+        ;;
+    esac
+
+    if [ "$run_setup" = true ]; then
+      echo "Running setup hook (${reason}): ${setup_hook}"
+      if run_setup_hook "$worktree"; then
+        printf '%s\n' "$current_fp" >"$state_file"
+      else
+        echo "Setup hook exited non-zero; continuing (fingerprint not recorded)." >&2
+      fi
+    else
+      echo "Skipping setup hook (${reason})."
+    fi
+  fi
+
+  # Surface a failed pull prominently, AFTER the setup hook, so it isn't buried
+  # in the hook's output and is the last thing seen before the prompt.
+  if [ "$pull_failed" = true ]; then
+    local cur_branch
+    cur_branch="$(git -C "$worktree" branch --show-current 2>/dev/null || true)"
+    echo >&2
+    echo "  ############################################################" >&2
+    echo "  ##  PULL FAILED" >&2
+    echo "  ##" >&2
+    echo "  ##  '${cur_branch:-branch}' could not be fast-forwarded from" >&2
+    echo "  ##  its upstream -- it has diverged (or the remote is" >&2
+    echo "  ##  unreachable). The worktree was NOT changed; reconcile" >&2
+    echo "  ##  manually, e.g.:  git pull --rebase" >&2
+    echo "  ############################################################" >&2
+    echo >&2
+  fi
+
+  # Launch an interactive shell in the worktree. A non-zero exit from the shell
+  # (e.g. the last interactive command failed) must not abort cleanup.
+  echo "Entering worktree: ${worktree}"
+  ( cd "$worktree" && exec "${SHELL:-/bin/bash}" ) || true
+
+  # When the shell exits, offer to clean the worktree up.
+  cleanup "$worktree"
+}
+
+function cleanup {
+  local worktree="$1"
+  worktree="$(realpath "$worktree")"
+
+  # Only a candidate for removal if nothing is running under it...
+  if worktree_in_use "$worktree"; then
+    echo "Worktree still in use (a process is running under it); leaving it in place: ${worktree}" >&2
+    return 0
+  fi
+
+  # ...and it holds no uncommitted work (untracked-but-not-ignored files count).
+  if [ -n "$(git -C "$worktree" status --porcelain 2>/dev/null)" ]; then
+    echo "Worktree has uncommitted changes; leaving it in place: ${worktree}" >&2
+    return 0
+  fi
+
+  local reply=""
+  read -r -p "Remove worktree '${worktree}'? [y/N] " reply </dev/tty || reply=""
+  case "$reply" in
+    y | Y | yes | Yes) ;;
+    *)
+      echo "Kept worktree: ${worktree}"
+      return 0
+      ;;
+  esac
+
+  # git refuses a plain `git worktree remove` on a worktree that has submodules
+  # registered (regardless of whether they're populated), so --force is required
+  # there. It's safe: the clean-check above already refused any real uncommitted
+  # work -- including dirty or untracked submodule content, which surfaces in the
+  # superproject status -- so --force only overrides the submodule objection.
+  local -a remove_opts=()
+  if worktree_has_submodules "$worktree"; then
+    remove_opts=(--force)
+  fi
+
+  if ! git worktree remove "${remove_opts[@]}" "$worktree"; then
+    echo "Failed to remove worktree: ${worktree}" >&2
+    return 0
+  fi
+
+  # Drop our own per-worktree setup state so the branch directory can be tidied.
+  rm -f "$(setup_state_file "$worktree")"
+
+  # Tidy up now-empty parent directories (e.g. the <branch> dir left behind by a
+  # slash-containing branch name), stopping at the worktrees root.
+  local parent
+  parent="$(dirname "$worktree")"
+  while [ -n "$parent" ] && [ "$parent" != "$worktrees_root" ] && [ "$parent" != "/" ]; do
+    rmdir "$parent" 2>/dev/null || break
+    parent="$(dirname "$parent")"
+  done
+
+  echo "Removed worktree: ${worktree}"
+}
+
+function checkout {
+  local branch="$1"
+  local pull="${2:-false}"
+  local setup_mode="${3:-auto}"
+  local submodule_mode="${4:-on}"
+
+  # If a worktree already has this branch checked out, enter it -- but only if it
+  # lives under the managed hierarchy. We refuse to touch worktrees elsewhere
+  # (e.g. the main worktree, or a hand-created one) rather than operate on them.
+  local existing
+  existing="$(worktree_for_branch "$branch")"
+  if [ -n "$existing" ]; then
+    case "$existing" in
+      "$worktrees_root"/*)
+        launch "$existing" "$pull" "$setup_mode" "$submodule_mode"
+        return
+        ;;
+      *)
+        echo "Error: branch '${branch}' is already checked out in a worktree outside the" >&2
+        echo "managed hierarchy, so wt will not touch it:" >&2
+        echo "  ${existing}" >&2
+        echo "Managed worktrees live under: ${worktrees_root}" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  local path="${worktrees_root}/${branch}/${repo_name}"
+
+  if git show-ref --verify --quiet "refs/heads/${branch}"; then
+    # Local branch exists but isn't checked out anywhere.
+    git worktree add "$path" "$branch"
+  elif git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+    # Only a remote branch exists; create a local tracking branch for it.
+    git worktree add --track -b "$branch" "$path" "origin/${branch}"
+  else
+    # Branch doesn't exist at all: offer to create it from the default branch.
+    local base
+    base="$(default_base_ref)"
+    local reply=""
+    read -r -p "Branch '${branch}' does not exist. Create it from '${base}'? [y/N] " reply </dev/tty || reply=""
+    case "$reply" in
+      y | Y | yes | Yes) ;;
+      *)
+        echo "Aborted; no branch created."
+        return 1
+        ;;
+    esac
+    git worktree add -b "$branch" "$path" "$base"
+  fi
+
+  launch "$path" "$pull" "$setup_mode" "$submodule_mode"
+}
+
+command="${1:-}"
+
+case "$command" in
+  co | checkout)
+    shift || true
+    branch=""
+    pull=false
+    setup_mode=auto
+    submodule_mode=on
+    for arg in "$@"; do
+      case "$arg" in
+        -p | --pull) pull=true ;;
+        --setup) setup_mode=force ;;
+        --no-setup) setup_mode=skip ;;
+        --submodules) submodule_mode=on ;;
+        --no-submodules) submodule_mode=skip ;;
+        -*)
+          echo "Unknown option: ${arg}" >&2
+          exit 1
+          ;;
+        *)
+          if [ -z "$branch" ]; then
+            branch="$arg"
+          else
+            echo "Unexpected argument: ${arg}" >&2
+            exit 1
+          fi
+          ;;
+      esac
+    done
+    if [ -z "$branch" ]; then
+      echo "Usage: wt {co|checkout} [-p|--pull] [--[no-]setup] [--[no-]submodules] <branch>" >&2
+      exit 1
+    fi
+    checkout "$branch" "$pull" "$setup_mode" "$submodule_mode"
+    ;;
+  prune)
+    # Run cleanup for every worktree living under the worktrees root.
+    mapfile -t all_worktrees < <(git worktree list --porcelain | awk '/^worktree /{print substr($0, 10)}')
+    for wt in "${all_worktrees[@]}"; do
+      case "$wt" in
+        "$worktrees_root"/*) cleanup "$wt" ;;
+      esac
+    done
+    ;;
+  *)
+    echo "Usage: wt {co|checkout [-p|--pull] [--[no-]setup] [--[no-]submodules] <branch> | prune}" >&2
+    exit 1
+    ;;
+esac

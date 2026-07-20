@@ -1,0 +1,62 @@
+#compdef wt
+# Zsh completion for the `wt` git-worktree wrapper.
+#
+# Install: put this file (named `_wt`) in a directory on your $fpath, e.g.
+#   mkdir -p ~/.zsh/completions
+#   cp _wt ~/.zsh/completions/
+# then, in ~/.zshrc BEFORE `compinit` runs:
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -Uz compinit && compinit
+
+# Branch names wt understands: local branches plus remote branches with the
+# remote prefix stripped (wt resolves `origin/<branch>`), minus origin/HEAD.
+_wt_branches() {
+  local -a names
+  local ref
+  names=( ${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)"} )
+  for ref in ${(f)"$(git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null)"}; do
+    [[ $ref == */HEAD ]] && continue
+    names+=( ${ref#*/} )
+  done
+  names=( ${(u)names} )
+  _describe -t branches 'branch' names
+}
+
+_wt() {
+  local curcontext="$curcontext" state line
+  typeset -A opt_args
+
+  _arguments -C \
+    '1: :->command' \
+    '*:: :->args'
+
+  case $state in
+    command)
+      local -a commands
+      commands=(
+        'co:check out or create a branch in a managed worktree'
+        'checkout:check out or create a branch in a managed worktree'
+        'prune:clean up managed worktrees'
+      )
+      _describe -t commands 'wt command' commands
+      ;;
+    args)
+      case $line[1] in
+        co|checkout)
+          _arguments \
+            '(-p --pull)'{-p,--pull}'[update the branch from its remote before launching]' \
+            '(--no-setup)--setup[force-run the setup hook]' \
+            '(--setup)--no-setup[skip the setup hook]' \
+            '(--no-submodules)--submodules[update submodules on launch (default)]' \
+            '(--submodules)--no-submodules[skip updating submodules]' \
+            '1:branch:_wt_branches'
+          ;;
+        prune)
+          _message 'no arguments'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_wt "$@"
