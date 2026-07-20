@@ -303,7 +303,7 @@ function checkout {
         return 1
         ;;
     esac
-    git worktree add -b "$branch" "$path" "$base"
+    git worktree add --no-track -b "$branch" "$path" "$base"
   fi
 
   launch "$path" "$pull" "$setup_mode" "$submodule_mode"
